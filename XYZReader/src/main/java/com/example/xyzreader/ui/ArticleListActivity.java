@@ -1,12 +1,16 @@
 package com.example.xyzreader.ui;
 
+import android.annotation.TargetApi;
+import android.app.ActivityOptions;
 import android.app.LoaderManager;
+import android.app.SharedElementCallback;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.Loader;
 import android.database.Cursor;
+import android.os.Build;
 import android.os.Bundle;
 import android.support.v4.widget.SwipeRefreshLayout;
 import android.support.v7.app.ActionBarActivity;
@@ -16,6 +20,7 @@ import android.support.v7.widget.Toolbar;
 import android.text.format.DateUtils;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 import android.widget.TextView;
 
 import com.example.xyzreader.R;
@@ -23,6 +28,11 @@ import com.example.xyzreader.data.ArticleLoader;
 import com.example.xyzreader.data.ItemsContract;
 import com.example.xyzreader.data.UpdaterService;
 
+import java.util.List;
+import java.util.Map;
+
+import static android.os.Build.VERSION.SDK_INT;
+import static android.os.Build.VERSION_CODES.LOLLIPOP;
 import static com.example.xyzreader.data.UpdaterService.BROADCAST_ACTION_STATE_CHANGE;
 import static com.example.xyzreader.data.UpdaterService.EXTRA_REFRESHING;
 
@@ -39,6 +49,12 @@ public class ArticleListActivity extends ActionBarActivity implements
     private SwipeRefreshLayout mSwipeRefreshLayout;
     private RecyclerView mRecyclerView;
 
+    private Bundle mReenterState;
+
+    private boolean isLoading;
+
+    private Cursor mCursorObject;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -46,17 +62,19 @@ public class ArticleListActivity extends ActionBarActivity implements
 
         mToolbar = (Toolbar) findViewById(R.id.toolbar);
 
-
-        final View toolbarContainerView = findViewById(R.id.toolbar_container);
-
         mSwipeRefreshLayout = (SwipeRefreshLayout) findViewById(R.id.swipe_refresh_layout);
         mSwipeRefreshLayout.setOnRefreshListener(this);
 
         mRecyclerView = (RecyclerView) findViewById(R.id.recycler_view);
         getLoaderManager().initLoader(0, null, this);
+        isLoading = true;
 
         if (savedInstanceState == null) {
             refresh();
+        }
+
+        if (SDK_INT >= LOLLIPOP) {
+            setSharedElementCallback();
         }
     }
 
@@ -106,6 +124,7 @@ public class ArticleListActivity extends ActionBarActivity implements
 
     @Override
     public void onLoadFinished(Loader<Cursor> cursorLoader, Cursor cursor) {
+        isLoading = false;
         Adapter adapter = new Adapter(cursor);
         adapter.setHasStableIds(true);
         mRecyclerView.setAdapter(adapter);
@@ -113,6 +132,8 @@ public class ArticleListActivity extends ActionBarActivity implements
         StaggeredGridLayoutManager sglm =
                 new StaggeredGridLayoutManager(columnCount, StaggeredGridLayoutManager.VERTICAL);
         mRecyclerView.setLayoutManager(sglm);
+
+        scrollToNewPosition();
     }
 
     @Override
@@ -124,6 +145,7 @@ public class ArticleListActivity extends ActionBarActivity implements
         private Cursor mCursor;
 
         public Adapter(Cursor cursor) {
+            mCursorObject = cursor;
             mCursor = cursor;
         }
 
@@ -140,8 +162,20 @@ public class ArticleListActivity extends ActionBarActivity implements
             view.setOnClickListener(new View.OnClickListener() {
                 @Override
                 public void onClick(View view) {
-                    startActivity(new Intent(Intent.ACTION_VIEW,
-                            ItemsContract.Items.buildItemUri(getItemId(vh.getAdapterPosition()))));
+                    Bundle bundle = new Bundle();
+                    if (SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                        mCursor.moveToPosition(vh.getAdapterPosition());
+                        String transitionName = mCursor.getString(ArticleLoader.Query.TITLE);
+                        bundle = ActivityOptions.makeSceneTransitionAnimation(
+                                ArticleListActivity.this,
+                                vh.thumbnailView,
+                                transitionName)
+                                .toBundle();
+                    }
+                    Intent intent = new Intent(Intent.ACTION_VIEW,
+                            ItemsContract.Items.buildItemUri(getItemId(vh.getAdapterPosition())));
+                    intent.putExtra(ArticleDetailActivity.STARTING_POSITION, vh.getAdapterPosition());
+                    startActivity(intent, bundle);
                 }
             });
             return vh;
@@ -156,12 +190,17 @@ public class ArticleListActivity extends ActionBarActivity implements
                             mCursor.getLong(ArticleLoader.Query.PUBLISHED_DATE),
                             System.currentTimeMillis(), DateUtils.HOUR_IN_MILLIS,
                             DateUtils.FORMAT_ABBREV_ALL).toString());
-                            /*+ " by "
-                            + mCursor.getString(ArticleLoader.Query.AUTHOR));*/
             holder.thumbnailView.setImageUrl(
                     mCursor.getString(ArticleLoader.Query.THUMB_URL),
                     ImageLoaderHelper.getInstance(ArticleListActivity.this).getImageLoader());
             holder.thumbnailView.setAspectRatio(mCursor.getFloat(ArticleLoader.Query.ASPECT_RATIO));
+
+            // to create unique transition ids
+            if (SDK_INT >= LOLLIPOP) {
+                String transitionName = mCursor.getString(ArticleLoader.Query.TITLE);
+                holder.thumbnailView.setTransitionName(transitionName);
+                holder.thumbnailView.setTag(transitionName);
+            }
         }
 
         @Override
@@ -181,5 +220,73 @@ public class ArticleListActivity extends ActionBarActivity implements
             titleView = (TextView) view.findViewById(R.id.article_title);
             subtitleView = (TextView) view.findViewById(R.id.article_subtitle);
         }
+    }
+
+    @Override
+    public void onActivityReenter(int resultCode, Intent data) {
+        super.onActivityReenter(resultCode, data);
+        mReenterState = new Bundle(data.getExtras());
+        if (SDK_INT >= LOLLIPOP) {
+            postponeEnterTransition();
+        }
+
+        if (!isLoading) {
+            scrollToNewPosition();
+        }
+    }
+
+    private void scrollToNewPosition() {
+        if (mReenterState != null) {
+            int startingPosition = mReenterState.getInt(ArticleDetailActivity.STARTING_POSITION);
+            int currentPosition = mReenterState.getInt(ArticleDetailActivity.CURRENT_POSITION);
+
+            if (startingPosition != currentPosition) {
+                mRecyclerView.scrollToPosition(currentPosition);
+            }
+
+            postponedTransitionStart();
+        }
+    }
+
+
+    @TargetApi(Build.VERSION_CODES.LOLLIPOP)
+    private void postponedTransitionStart() {
+        mRecyclerView.getViewTreeObserver().addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
+            @Override
+            public boolean onPreDraw() {
+                mRecyclerView.getViewTreeObserver().removeOnPreDrawListener(this);
+                mRecyclerView.requestLayout();
+                startPostponedEnterTransition();
+                return true;
+            }
+        });
+    }
+
+    @TargetApi(Build.VERSION_CODES.LOLLIPOP)
+    private void setSharedElementCallback() {
+        SharedElementCallback sharedElementCallback = new SharedElementCallback() {
+            @Override
+            public void onMapSharedElements(List<String> names, Map<String, View> sharedElements) {
+                if (mReenterState != null) {
+                    int startingPosition = mReenterState.getInt(ArticleDetailActivity.STARTING_POSITION);
+                    int currentPosition = mReenterState.getInt(ArticleDetailActivity.CURRENT_POSITION);
+                    if (startingPosition != currentPosition) {
+                        mCursorObject.moveToPosition(currentPosition);
+                        String newTransitionName = mCursorObject.getString(ArticleLoader.Query.TITLE);
+                        View view = mRecyclerView.findViewWithTag(newTransitionName);
+                        if (newTransitionName != null) {
+                            names.clear();
+                            names.add(newTransitionName);
+                            sharedElements.clear();
+                            sharedElements.put(newTransitionName, view);
+                        }
+                    }
+
+                    mReenterState = null;
+                }
+            }
+        };
+
+        setExitSharedElementCallback(sharedElementCallback);
     }
 }
